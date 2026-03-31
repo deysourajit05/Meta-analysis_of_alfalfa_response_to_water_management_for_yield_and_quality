@@ -1,0 +1,1860 @@
+#Code used to clear the console
+rm(list = ls())
+cat("\014")
+if (!is.null(dev.list())) dev.off()
+
+
+library(mice) #For imputation
+library(revtools)
+library(dplyr)
+library(metafor)
+library(purrr)
+library(ggplot2)
+library(tidyr) # For pivot_longer
+library(patchwork) # For combining plots
+library(forcats)   # For ordering factors in plots
+library(cowplot)
+library(meta)
+library(maps)
+library(geodata)
+library(terra)
+library(sf)
+library(ggspatial)
+library(ggpmisc)
+
+#This dataset is prepared using Zotero by just removing the duplicated files as two datasources was used
+bib <- revtools::read_bibliography("Meta_analysis_cleaned_dataset.ris")
+
+# Screening the abstracts based on abstracts and title using Revtools
+revtools::screen_abstracts(bib)
+
+# Loading raw data
+meta <- read.csv("Metaanalysis_dataset_for_R_raw.csv", header=T)
+meta
+# 
+# #Run multiple imputation
+# ###############################################################
+
+# the function for imputation
+impute_sd <- function(data, mean_var, sd_var, new_name, m = 1000, seed = 123) {
+
+  df_tmp <- data %>%
+    dplyr::select(all_of(c(mean_var, sd_var)))
+
+  imp <- mice(
+    df_tmp,
+    m = m,
+    method = c("", "pmm"),  # do not impute mean, impute SD only
+    seed = seed,
+    printFlag = FALSE
+  )
+
+  sd_imp <- mice::complete(imp, action = 1)[[sd_var]]
+
+  data %>%
+    mutate(!!new_name := sd_imp)
+}
+
+#Define what needs to be imputed
+impute_specs <- tibble::tibble(
+  mean_var = c(
+    "Yield_kg_trt",
+    "Yield_kg_ctrl",
+    "CP_trt",
+    "CP_ctrl",
+    "IWUE_kg.ha.mm_trt",
+    "CWP_kg.ha.mm_trt",
+    "TWP_kg.ha.mm_trt",
+    "IWUE_kg.ha.mm_ctrl",
+    "CWP_kg.ha.mm_ctrl",
+    "TWP_kg.ha.mm_ctrl"),
+
+  sd_var = c(
+    "Yield_kg_SD_trt",
+    "Yield_kg_SD_ctrl",
+    "CP_SD_trt",
+    "CP_SD_ctrl",
+    "IWUE_kg.ha.mm_SD_trt",
+    "CWP_kg.ha.mm_SD_trt",
+    "TWP_kg.ha.mm_SD_trt",
+    "IWUE_kg.ha.mm_SD_ctrl",
+    "CWP_kg.ha.mm_SD_ctrl",
+    "TWP_kg.ha.mm_SD_ctrl"),
+
+  new_name = c(
+    "Yield_SD_trt_imp",
+    "Yield_SD_ctrl_imp",
+    "CP_SD_trt_imp",
+    "CP_SD_ctrl_imp",
+    "IWUE_kg.ha.mm_SD_trt_imp",
+    "CWP_kg.ha.mm_SD_trt_imp",
+    "TWP_kg.ha.mm_SD_trt_imp",
+    "IWUE_kg.ha.mm_SD_ctrl_imp",
+    "CWP_kg.ha.mm_SD_ctrl_imp",
+    "TWP_kg.ha.mm_SD_ctrl_imp"
+  )
+)
+
+#Looping this up
+meta_imp <- meta
+
+for (i in seq_len(nrow(impute_specs))) {
+  meta_imp <- impute_sd(
+    data    = meta_imp,
+    mean_var = impute_specs$mean_var[i],
+    sd_var   = impute_specs$sd_var[i],
+    new_name = impute_specs$new_name[i],
+    m        = 1000,
+    seed     = 123
+  )
+}
+
+#Data downloading with four new imputed columns
+# write.csv(meta_imp, "Metanalysis_dataset_imputed.csv", row.names = FALSE)
+#################################################################################
+
+meta_es <- meta_imp %>%
+  dplyr::mutate(
+    #Log-response and variance for Yield
+    Yield_LnR = log(Yield_kg_trt / Yield_kg_ctrl),
+
+    Yield_Variance = (Yield_SD_ctrl_imp^2 / (Rep_ctrl * Yield_kg_ctrl^2)) +
+      (Yield_SD_trt_imp^2  / (Rep_trt  * Yield_kg_trt^2)),
+
+    #Log-response and variance for CP
+    CP_LnR = log(CP_trt / CP_ctrl),
+
+    CP_Variance = (CP_SD_ctrl_imp^2 / (Rep_ctrl * CP_ctrl^2)) +
+      (CP_SD_trt_imp^2  / (Rep_trt  * CP_trt^2)),
+
+    #Log-response and variance for IWUE
+    IWUE_LnR = log(IWUE_kg.ha.mm_trt / IWUE_kg.ha.mm_ctrl),
+
+    IWUE_Variance = (IWUE_kg.ha.mm_SD_ctrl_imp^2 / (Rep_ctrl * IWUE_kg.ha.mm_ctrl^2)) +
+      (IWUE_kg.ha.mm_SD_trt_imp^2  / (Rep_trt  * IWUE_kg.ha.mm_trt^2)),
+
+    #Log-response and variance for TWP
+    TWP_LnR = log(TWP_kg.ha.mm_trt / TWP_kg.ha.mm_ctrl),
+
+    TWP_Variance = (TWP_kg.ha.mm_SD_ctrl_imp^2 / (Rep_ctrl * TWP_kg.ha.mm_ctrl^2)) +
+      (TWP_kg.ha.mm_SD_trt_imp^2  / (Rep_trt  * TWP_kg.ha.mm_trt^2)),
+
+    #weights
+    Yield_weight = 1/Yield_Variance,
+    CP_weight = 1/CP_Variance,
+    IWUE_weight = 1/IWUE_Variance,
+    TWP_weight = 1/TWP_Variance
+  )
+
+#####################################################################################
+
+#Making the categories for Moderators with continuous values
+# For Degree of Deficit irrigation
+meta_es <- meta_es %>%
+  mutate(
+    Degree_of_irri_deficit_grp = case_when(
+      Degree_of_irri_deficit < 0.35 ~ "Severe (<0.35)",
+      Degree_of_irri_deficit >= 0.35 & Degree_of_irri_deficit <= 0.70 ~ "Moderate (0.35-0.70)",
+      Degree_of_irri_deficit > 0.70 ~ "Slight (>0.70)",
+      TRUE ~ NA_character_
+    )
+  )
+
+# For Climate regions
+meta_es <- meta_es %>%
+  mutate(
+    MAP_mm_grp = case_when(
+      MAP_mm < 250 ~ "<250 mm",
+      MAP_mm >= 250 & MAP_mm <= 500 ~ "250–500 mm",
+      MAP_mm > 500 ~ ">500 mm",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$MAP_mm_grp <- factor(
+  meta_es$MAP_mm_grp,
+  levels = c("<250 mm", "250–500 mm", ">500 mm")
+)
+
+# For mean annual temperature
+meta_es <- meta_es %>%
+  mutate(
+    MAT_degreeC_grp = case_when(
+      MAT_degreeC <= 10 ~ "≤10 °C",
+      MAT_degreeC > 10 ~ ">10 °C",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$MAT_degreeC_grp <- factor(
+  meta_es$MAT_degreeC_grp,
+  levels = c("≤10 °C", ">10 °C")
+)
+
+
+# For Soil Bulk Density
+meta_es <- meta_es %>%
+  mutate(
+    Soil_BD_grp = case_when(
+      Soil_BD_g.cm.3 < 1.4 ~ "<1.4 g cm^-3",
+      Soil_BD_g.cm.3 >= 1.4 & Soil_BD_g.cm.3 <= 1.5 ~ "1.4–1.5 g cm^-3",
+      Soil_BD_g.cm.3 > 1.5 ~ ">1.5 g cm^-3",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$Soil_BD_grp <- factor(
+  meta_es$Soil_BD_grp,
+  levels = c("<1.4 g cm^-3", "1.4–1.5 g cm^-3", ">1.5 g cm^-3")
+)
+
+# For Soil pH
+meta_es <- meta_es %>%
+  mutate(
+    Soil_pH_grp = case_when(
+      Soil_pH <= 7 ~ "≤7",
+      Soil_pH > 7 ~ ">7",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$Soil_pH_grp <- factor(
+  meta_es$Soil_pH_grp,
+  levels = c("≤7", ">7")
+)
+
+
+# For Soil Organic Matter
+meta_es <- meta_es %>%
+  mutate(
+    Soil_OM_grp = case_when(
+      Soil_OM_. <= 1.0 ~ "≤1 %",
+      Soil_OM_. > 1.0 ~ ">1 %",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$Soil_OM_grp <- factor(
+  meta_es$Soil_OM_grp,
+  levels = c("≤1 %", ">1 %")
+)
+
+# For Winterhardiness
+meta_es <- meta_es %>%
+  mutate(
+    Winterhardiness_grp = case_when(
+      Winterhardiness %in% c("4a", "4b") ~ "4a–4b",
+      Winterhardiness %in% c("5a", "5b", "6a", "6b", "7a", "7b") ~ "5a–7b",
+      Winterhardiness %in% c("8a", "8b", "9a", "9b") ~ "8a–9b",
+      TRUE ~ NA_character_
+    )
+  )
+
+meta_es$Winterhardiness_grp <- factor(
+  meta_es$Winterhardiness_grp,
+  levels = c("4a–4b", "5a–7b", "8a–9b")
+)
+
+# For lat and long
+meta_es <- meta_es %>%
+  mutate(
+    Latitude_grp = case_when(
+      Latitude < 35 ~ "Southern region",
+      Latitude >= 35 & Latitude <= 45 ~ "Mid region",
+      Latitude > 45 ~ "Northern region",
+      TRUE ~ NA_character_
+    ),
+    # Create Longitude groups
+    Longitude_grp = case_when(
+      Longitude > -100 ~ "Humid East",
+      Longitude < -100 ~ "Arid West",
+      TRUE ~ NA_character_
+    )
+  )
+
+##################################################################################################
+
+#Now this is to get the Qm and P value directly for yield, CP, IWUE, and TWP all at a time for all the moderators in a loop
+
+outcomes <- c("Yield", "CP", "IWUE", "TWP")
+moderators <- c("Irrigation_method", "Irri_amt", "Degree_of_irri_deficit_grp", 
+                "Irrigation_scheduling", "MAP_mm_grp", "MAT_degreeC_grp", 
+                "Texture", "Soil_BD_grp", "Soil_pH_grp", "Soil_OM_grp", 
+                "Winterhardiness_grp", "Latitude_grp", "Longitude_grp")
+
+model_list <- list()
+qm_summary <- data.frame()
+
+for (out in outcomes) {
+  for (mod in moderators) {
+    
+    yi_col <- paste0(out, "_LnR")
+    V_col  <- paste0(out, "_Variance")
+    W_col  <- paste0(out, "_weight")
+    
+    # Run Model
+    res <- try(rma.mv(
+      yi = meta_es[[yi_col]],
+      V  = meta_es[[V_col]],
+      W  = meta_es[[W_col]],
+      mods = as.formula(paste("~", mod)),
+      random = ~ 1 | Study_ID / Location_ID,
+      data = meta_es
+    ), silent = TRUE)
+    
+    if (!inherits(res, "try-error")) {
+      model_list[[out]][[mod]] <- res
+      
+      # Extract QM, df, and p-value
+      temp_res <- data.frame(
+        Outcome = out,
+        Moderator = mod,
+        QM_stat = round(res$QM, 4),
+        df = res$p - 1, # Number of coefficients minus intercept
+        p_val = round(res$QMp, 4)
+      )
+      qm_summary <- rbind(qm_summary, temp_res)
+    }
+  }
+}
+
+# View results
+print(qm_summary)
+
+
+##################################################################################
+
+
+meta_es$Study_ID <- as.factor(meta_es$Study_ID)
+meta_es$Location_ID <- as.factor(meta_es$Location_ID)
+meta_es$Irrigation_method <- as.factor(meta_es$Irrigation_method)
+meta_es$Texture <- as.factor(meta_es$Texture)
+
+
+#####################################################################################
+model_nested <- rma.mv(
+  yi = Yield_LnR,
+  V = Yield_Variance,
+  random = ~ 1 | Study_ID / Location_ID, # Nesting: Location within Study
+  data = meta_es
+)
+
+summary(model_nested)
+
+#########################################################################################
+# library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(metafor)
+library(cowplot)
+
+# -------------------------------------------------------------------------
+# 1. Helper Function to Calculate Total I^2 for rma.mv models
+# -------------------------------------------------------------------------
+# Standard rma.mv doesn't give a single I^2. This calculates the total 
+# proportion of variance attributed to heterogeneity (Study + Location).
+calc_i2 <- function(model) {
+  n <- model$k
+  p <- model$p
+  # Typical sampling variance (W)
+  wi <- 1/diag(model$V)
+  s2w <- (n - p) / (sum(wi) - sum(wi^2)/sum(wi))
+  # Sum of all random effect variance components
+  total_sigma2 <- sum(model$sigma2)
+  i2 <- (total_sigma2 / (total_sigma2 + s2w)) * 100
+  return(round(i2, 1))
+}
+
+# -------------------------------------------------------------------------
+# 2. Main Function for Modeled Frequency Panels
+# -------------------------------------------------------------------------
+generate_modeled_freq_panel <- function(df, outcome_var, x_label, model_obj) {
+  # Filter data for specific outcome
+  df_sub <- df %>% filter(Outcome_Var == outcome_var & !is.na(Effect_Size_LnR))
+  
+  # --- Extract Stats from the Model ---
+  model_estimate <- as.numeric(coef(model_obj)) # Modeled Mean (LnR)
+  model_p        <- model_obj$pval              # Modeled P-value
+  n_obs          <- model_obj$k                 # Sample Size
+  i2_val         <- calc_i2(model_obj)          # Heterogeneity (I^2)
+  
+  # Back-transform Estimate to %
+  xc_val <- (exp(model_estimate) - 1) * 100
+  
+  # Histogram math for curve scaling
+  bin_width <- (max(df_sub$Effect_Size_LnR, na.rm=T) - min(df_sub$Effect_Size_LnR, na.rm=T)) / 20
+  raw_sd    <- sd(df_sub$Effect_Size_LnR, na.rm=T)
+  
+  ggplot(df_sub, aes(x = Effect_Size_LnR)) + 
+    geom_histogram(bins = 20, color = "white", fill = "gray60", alpha = 0.7) +
+    
+    # Normal curve centered at the MODEL ESTIMATE
+    stat_function(fun = function(x) dnorm(x, mean = model_estimate, sd = raw_sd) * n_obs * bin_width, 
+                  color = "black", size = 1) +
+    
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.7) +
+    
+    # --- ANNOTATIONS ---
+    # 1. xc line (Model Mean)
+    annotate("text", x = -Inf, y = Inf, label = paste0("x[c] == ", round(xc_val, 2), "*'%'"),
+             hjust = -0.2, vjust = 1.5, size = 3.5, parse = TRUE) +
+    
+    # # 2. R2 line 
+    # annotate("text", x = -Inf, y = Inf, label = "R^2 == 0.93",
+    #          hjust = -0.25, vjust = 3.2, size = 3.5, parse = TRUE) +
+    
+    # 3. I2 line (New Heterogeneity metric)
+    annotate("text", x = -Inf, y = Inf, label = paste0("I^2 == ", i2_val, "*'%'"),
+             hjust = -0.25, vjust = 2.8, size = 3.5, parse = TRUE) +
+    
+    # 4. P-value (Model P-value)
+    annotate("text", x = -Inf, y = Inf, 
+             label = ifelse(model_p < 0.001, "P < 0.001", paste0("P == ", round(model_p, 3))),
+             hjust = -0.2, vjust = 5.7, size = 3.5, parse = TRUE) +
+    
+    # 5. Sample size (n)
+    annotate("text", x = -Inf, y = Inf, label = paste0("n == ", n_obs),
+             hjust = -0.3, vjust = 7.3, size = 3.5, parse = TRUE) +
+    
+    theme_bw() +
+    labs(y = NULL, x = x_label) + # Y label removed here; added globally later
+    theme(
+      panel.grid = element_blank(),
+      axis.title.x = element_text(size = 9, face = "bold"),
+      axis.text = element_text(size = 8)
+    )
+}
+
+# -------------------------------------------------------------------------
+# 3. Fit Models and Generate Plot
+# -------------------------------------------------------------------------
+
+# First, ensure your data is pivoted
+plot_data_freq <- meta_es %>%
+  pivot_longer(
+    cols = c(Yield_LnR, CP_LnR, IWUE_LnR, TWP_LnR),
+    names_to = "Outcome_Var", 
+    values_to = "Effect_Size_LnR"
+  )
+
+# Fit your four multilevel models (Adjust variable names as per your dataset)
+m1 <- rma.mv(Yield_LnR, Yield_Variance, random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+m2 <- rma.mv(CP_LnR,    CP_Variance,    random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+m3 <- rma.mv(IWUE_LnR,  IWUE_Variance,  random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+m4 <- rma.mv(TWP_LnR,   TWP_Variance,   random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+
+# Generate individual panels
+pf1 <- generate_modeled_freq_panel(plot_data_freq, "Yield_LnR", "Effect size of forage yield (LRR)", m1)
+pf2 <- generate_modeled_freq_panel(plot_data_freq, "CP_LnR",    "Effect size of crude protein (LRR)", m2)
+pf3 <- generate_modeled_freq_panel(plot_data_freq, "IWUE_LnR",  "Effect size of IWUE (LRR)", m3)
+pf4 <- generate_modeled_freq_panel(plot_data_freq, "TWP_LnR",   "Effect size of TWP (LRR)", m4)
+
+# Combine using patchwork
+final_grid <- (pf1 | pf2) / (pf3 | pf4) + 
+  plot_annotation(tag_levels = 'a', tag_suffix = ')') & 
+  theme(plot.tag = element_text(size = 11, face = "bold"))
+
+# Final Touch: Add the shared Y-axis label using cowplot
+final_plot <- ggdraw(final_grid) +
+  draw_label("Frequency", x = 0.008, y = 0.5, angle = 90, vjust = 0.5, size = 11, fontface = "bold")
+
+print(final_plot)
+
+ggsave("Frequency_plot_Grid.png", final_plot, width = 8, height = 8, dpi = 300)
+
+
+# List of your models
+# 1. Re-run the base nested models to get the SEs
+res_yield <- rma.mv(yi = Yield_LnR, V = Yield_Variance, 
+                    random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+
+res_cp    <- rma.mv(yi = CP_LnR, V = CP_Variance, 
+                    random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+
+res_iwue  <- rma.mv(yi = IWUE_LnR, V = IWUE_Variance, 
+                    random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+
+res_twp   <- rma.mv(yi = TWP_LnR, V = TWP_Variance, 
+                    random = ~ 1 | Study_ID/Location_ID, data = meta_es)
+
+# 2. Extract and convert to Percentage Scale
+get_stats <- function(model) {
+  est <- as.numeric(model$beta)
+  se  <- as.numeric(model$se)
+  
+  # xc is the percentage change
+  xc <- (exp(est) - 1) * 100
+  # SE for percentage change (Delta Method approximation)
+  xc_se <- exp(est) * se * 100
+  
+  return(round(xc_se, 2))
+}
+
+# 3. Print the SEs for your "+-" labels
+cat("Yield SE (%): ", get_stats(res_yield), "\n")
+cat("CP SE (%):    ", get_stats(res_cp), "\n")
+cat("IWUE SE (%):  ", get_stats(res_iwue), "\n")
+cat("TWP SE (%):   ", get_stats(res_twp), "\n")
+
+########################################### Q-Q plot ##########################################################################
+
+# 1. Individual Panel Function (No changes needed)
+generate_qq_panel <- function(df, outcome_var, specific_x_label) {
+  df_sub <- df %>% filter(Outcome_Var == outcome_var & !is.na(Effect_Size_LnR))
+  
+  ggplot(df_sub, aes(sample = Effect_Size_LnR)) +
+    stat_qq(size = 2, alpha = 0.6) + 
+    stat_qq_line(color = "red", linetype = "dashed", linewidth = 0.8) +
+    # Y is NULL because we add it with cowplot later
+    labs(x = specific_x_label, y = NULL) + 
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(), 
+      axis.title.x = element_text(size = 9, face = "bold"),
+      axis.text = element_text(size = 8, color = "black"),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)
+    )
+}
+
+# 2. Create the panels
+pq1 <- generate_qq_panel(plot_data_freq, "Yield_LnR", "Normal quantiles for yield (LRR)")
+pq2 <- generate_qq_panel(plot_data_freq, "CP_LnR",    "Normal quantiles for crude protein (LRR)")
+pq3 <- generate_qq_panel(plot_data_freq, "IWUE_LnR",  "Normal quantiles for IWUE (LRR)")
+pq4 <- generate_qq_panel(plot_data_freq, "TWP_LnR",   "Normal quantiles for TWP (LRR)")
+
+# 3. Create the 2x2 Grid using Patchwork
+# This handles the a, b, c, d tags perfectly
+qq_grid <- (pq1 | pq2) / (pq3 | pq4) + 
+  plot_annotation(
+    tag_levels = 'a', 
+    tag_suffix = ')'
+  ) & 
+  theme(
+    plot.tag.position = c(0.03, 1.02),
+    plot.tag = element_text(size = 11, face = "bold")
+  )
+
+# 4. Add the Shared Y-Axis Label using Cowplot
+# This puts the label on the far left without "stealing" a letter tag
+final_qq_plot <- cowplot::ggdraw(qq_grid) +
+  cowplot::draw_label("Observed quantiles (LRR)", 
+                      x = 0.01, y = 0.5, angle = 90, 
+                      vjust = 0.5, size = 11, fontface = "bold")
+
+# 5. Print the final result
+print(final_qq_plot)
+
+ggsave("QQ_plot_Grid.png", final_qq_plot, width = 8, height = 8, dpi = 300)
+
+#################################### Robust Variance Estimation (RVE)##########################################################################
+library(metafor)
+library(clubSandwich)
+
+# Define outcomes and their corresponding variance columns
+outcomes_vars <- list(
+  Yield = c("Yield_LnR", "Yield_Variance"),
+  CP    = c("CP_LnR",    "CP_Variance"),
+  IWUE  = c("IWUE_LnR",  "IWUE_Variance"),
+  TWP   = c("TWP_LnR",   "TWP_Variance")
+)
+
+# List to store results
+robust_results <- list()
+
+for (name in names(outcomes_vars)) {
+  yi_col <- outcomes_vars[[name]][1]
+  vi_col <- outcomes_vars[[name]][2]
+  
+  # 1. Fit the Nested Model (Location within Study)
+  # Using your structure: random = ~ 1 | Study_ID / Location_ID
+  res <- rma.mv(
+    yi = meta_es[[yi_col]],
+    V  = meta_es[[vi_col]],
+    random = ~ 1 | Study_ID / Location_ID,
+    data = meta_es
+  )
+  
+  # 2. Apply Robust Variance Estimation (Clustered by Study_ID)
+  # clubSandwich = TRUE is the gold standard for your n=193 dataset
+  res_robust <- robust(res, cluster = meta_es$Study_ID, clubSandwich = TRUE)
+  
+  # Store result
+  robust_results[[name]] <- res_robust
+}
+
+# Example: View Robust results for Yield
+print(robust_results[["Yield"]])
+
+summary_table <- data.frame()
+
+for (name in names(robust_results)) {
+  m <- robust_results[[name]]
+  
+  summary_table <- rbind(summary_table, data.frame(
+    Outcome = name,
+    Estimate = round(m$beta, 3),
+    CI_Lower = round(m$ci.lb, 3),
+    CI_Upper = round(m$ci.ub, 3),
+    P_Value_Robust = round(m$pval, 4)
+  ))
+}
+
+print(summary_table)
+
+####################################### REML V/S ROBUST ##############################################################################
+
+# 1. Define the variables and their corresponding variance columns
+outcomes <- list(
+  Yield = c("Yield_LnR", "Yield_Variance"),
+  CP    = c("CP_LnR",    "CP_Variance"),
+  IWUE  = c("IWUE_LnR",  "IWUE_Variance"),
+  TWP   = c("TWP_LnR",   "TWP_Variance")
+)
+
+# 2. Loop through each outcome to compare REML vs. Robust (RVE) results
+for (name in names(outcomes)) {
+  
+  # Fit the nested REML model (Study_ID / Location_ID)
+  m_reml <- rma.mv(yi = meta_es[[outcomes[[name]][1]]], 
+                   V  = meta_es[[outcomes[[name]][2]]], 
+                   random = ~ 1 | Study_ID/Location_ID, 
+                   data = meta_es)
+  
+  # Apply Cluster-Robust Variance Estimation (RVE) with clubSandwich
+  m_robust <- robust(m_reml, cluster = meta_es$Study_ID, clubSandwich = TRUE)
+  
+  # Extract standard errors and calculate CI widths
+  reml_se <- m_reml$se
+  rob_se  <- m_robust$se
+  reml_w  <- 2 * 1.96 * reml_se
+  rob_w   <- m_robust$ci.ub - m_robust$ci.lb
+  
+  # Print the comparison results
+  cat(paste0("--- ", name, " ---\n"))
+  cat("REML Width:  ", round(reml_w, 4), "\n")
+  cat("Robust Width:", round(rob_w, 4), "\n")
+  cat("SE Inflation:", round(((rob_se - reml_se) / reml_se) * 100, 2), "%\n\n")
+}
+
+################################################################################################
+
+library(ggplot2)
+
+# 1. Prepare the data from your RVE results
+# (Back-transforming LnR to Percent Change)
+forest_data <- data.frame(
+  Outcome = c("Yield", "Crude Protein (CP)", "IWUE", "TWP"),
+  Estimate_Pct = c(-29.0, 0.7, 25.2, 8.3),
+  Lower_CI = c(-38.8, -1.3, 3.6, -12.8),
+  Upper_CI = c(-17.6, 2.6, 51.4, 34.6),
+  P_Value = c(0.0002, 0.485, 0.024, 0.443)
+)
+
+# Add a significance label for the plot
+forest_data$Significance <- ifelse(forest_data$P_Value < 0.05, "Significant", "Non-Significant")
+
+# 2. Create the Forest Plot
+ggplot(forest_data, aes(x = Outcome, y = Estimate_Pct)) +
+  # Add a dashed line at zero (No Effect)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  # Add the error bars (Confidence Intervals)
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI, color = Significance), 
+                width = 0.2, linewidth = 1.2) +
+  # Add the point estimate (The Mean)
+  geom_point(aes(fill = Significance), shape = 21, size = 5, color = "black") +
+  # Flip coordinates to have outcomes on the left (Traditional Forest Plot style)
+  coord_flip() +
+  # Labels and Theme
+  labs(
+    x = NULL, 
+    y = "Percentage Change (%)",
+    subtitle = "Effect size of treatment on forage outcomes"
+  ) +
+  scale_color_manual(values = c("Significant" = "red3", "Non-Significant" = "black")) +
+  scale_fill_manual(values = c("Significant" = "red", "Non-Significant" = "white")) +
+  theme_bw() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.title.x = element_text(face = "bold", size = 11),
+    axis.text = element_text(size = 10, color = "black", face = "bold"),
+    legend.position = "none" # Hide legend to keep it clean
+  ) +
+  # Optional: Add text labels showing the actual % on the plot
+  geom_text(aes(label = paste0(round(Estimate_Pct, 1), "%")), 
+            vjust = -1.5, size = 3.5, fontface = "bold")
+
+
+######################################### PUBLICATION BIASS#######################################
+# Modified Egger's Test for Nested Data
+# 1. Define outcomes and their variance columns
+outcomes_list <- list(
+  Yield = c("Yield_LnR", "Yield_Variance"),
+  CP    = c("CP_LnR",    "CP_Variance"),
+  IWUE  = c("IWUE_LnR",  "IWUE_Variance"),
+  TWP   = c("TWP_LnR",   "TWP_Variance")
+)
+
+# 2. Run the Modified Egger's Test for each
+bias_results <- data.frame()
+
+for (name in names(outcomes_list)) {
+  yi_col <- outcomes_list[[name]][1]
+  vi_col <- outcomes_list[[name]][2]
+  
+  # Fit the nested model with SE as a moderator (sqrt of variance)
+  m_egger <- rma.mv(
+    yi = meta_es[[yi_col]], 
+    V  = meta_es[[vi_col]], 
+    mods = ~ sqrt(meta_es[[vi_col]]), # The SE moderator
+    random = ~ 1 | Study_ID/Location_ID, 
+    data = meta_es
+  )
+  
+  # Apply Robust Variance Estimation (Clustered by Study_ID)
+  m_robust <- robust(m_egger, cluster = meta_es$Study_ID, clubSandwich = TRUE)
+  
+  # Extract the p-value for the moderator (Publication Bias Test)
+  # In metafor mods models, the moderator is usually the 2nd coefficient
+  p_val_bias <- m_robust$pval[2] 
+  
+  bias_results <- rbind(bias_results, data.frame(
+    Outcome = name,
+    Egger_P_Value = round(p_val_bias, 4),
+    Interpretation = ifelse(p_val_bias > 0.05, "No Evidence of Bias", "Potential Bias Found")
+  ))
+}
+
+print(bias_results)
+
+library(grid)
+# 1. Prepare your data for the plot (Use your model results here)
+# We calculate the 'funnel' bounds (95% CI) manually for ggplot
+generate_funnel_data <- function(model_obj, outcome_label, p_val_bias) {
+  df <- data.frame(
+    yi = model_obj$yi,
+    se = sqrt(model_obj$vi),
+    Outcome = outcome_label
+  )
+  
+  # Calculate the funnel cone
+  max_se <- max(df$se)
+  se_seq <- seq(0, max_se, length.out = 100)
+  ll95 <- model_obj$beta - 1.96 * se_seq
+  ul95 <- model_obj$beta + 1.96 * se_seq
+  
+  cone <- data.frame(se = se_seq, lower = as.numeric(ll95), upper = as.numeric(ul95))
+  
+  list(data = df, cone = cone, p = p_val_bias, n = model_obj$k, estimate = as.numeric(model_obj$beta))
+}
+
+# 2. Function to create each individual panel
+
+plot_single_funnel <- function(obj_list, x_lab, tag) {
+  ggplot(obj_list$data, aes(x = yi, y = se)) +
+    # The Funnel Cone
+    geom_line(data = obj_list$cone, aes(x = lower, y = se), linetype = "dashed", color = "gray40") +
+    geom_line(data = obj_list$cone, aes(x = upper, y = se), linetype = "dashed", color = "gray40") +
+    # Individual Studies
+    geom_point(alpha = 0.6, shape = 21, fill = "gray70", size = 1.5) +
+    # Vertical line at mean effect
+    geom_vline(xintercept = obj_list$estimate, color = "red", linetype = "solid") +
+    
+    # --- FIXED ANNOTATION BLOCK ---
+    # We use x = -Inf and y = -Inf because scale_y_reverse flips the coordinate system
+    annotate("text", x = -Inf, y = -Inf, 
+             label = paste0("P = ", format(obj_list$p, nsmall = 3), "\nn = ", obj_list$n),
+             hjust = -0.2, vjust = 3.2, size = 3.5, fontface = "bold", color = "black") +
+    
+    scale_y_reverse() + # Reversed Y-axis (Standard Error 0 at top)
+    labs(x = x_lab, y = NULL, tag = tag) +
+    theme_bw() +
+    theme(
+      plot.tag = element_text(face = "bold", size = 12),
+      plot.tag.position = c(0.005, 1.02), # Moves a, b, c, d to the very top left
+      panel.grid = element_blank(),
+      axis.title.x = element_text(size = 9, face = "bold"),
+      axis.text = element_text(size = 8)
+    )
+}
+
+# Update p_val_bias with the exact values from your bias_results table
+d1 <- generate_funnel_data(m1, "Yield", 0.193)
+d2 <- generate_funnel_data(m2, "CP", 0.130)
+d3 <- generate_funnel_data(m3, "IWUE", 0.472)
+d4 <- generate_funnel_data(m4, "TWP", 0.082)
+
+# 2. Re-generate the 4 panels
+p1 <- plot_single_funnel(d1, "Effect size of forage yield (LRR)", "a)")
+p2 <- plot_single_funnel(d2, "Effect size of crude protein (LRR)", "b)")
+p3 <- plot_single_funnel(d3, "Effect size of IWUE (LRR)", "c)")
+p4 <- plot_single_funnel(d4, "Effect size of TWP (LRR)", "d)")
+
+# 3. Re-combine with the shared Y-axis label workaround
+main_grid <- (p1 | p2) / (p3 | p4)
+y_label <- grid::textGrob("Standard Error", rot = 90, gp = gpar(fontsize = 11, fontface = "bold"))
+
+final_funnel_plot <- wrap_elements(panel = y_label) + main_grid + 
+  plot_layout(widths = c(1, 40)) 
+
+print(final_funnel_plot)
+
+ggsave("Funnel_grid.png", final_funnel_plot, width = 8, height = 8, dpi = 300)
+
+##########################################################################################
+
+# --- SECTION A: Run All Meta-Analysis Models ---
+
+outcomes <- c("Yield", "CP", "IWUE", "TWP")
+moderators <- c("Irrigation_method", "Irri_amt", "Degree_of_irri_deficit_grp", 
+                "Irrigation_scheduling", "MAP_mm_grp", "MAT_degreeC_grp", 
+                "Texture", "Soil_BD_grp", "Soil_pH_grp", "Soil_OM_grp", 
+                "Winterhardiness_grp", "Latitude_grp", "Longitude_grp")
+
+model_list <- list()
+for (out in outcomes) {
+  model_list[[out]] <- list()
+  for (mod in moderators) {
+    yi_col <- paste0(out, "_LnR")
+    V_col  <- paste0(out, "_Variance")
+    W_col  <- paste0(out, "_weight")
+    
+    # Construct the formula *without* an intercept to get means for all levels
+    form_no_intercept <- as.formula(paste("~ 0 +", mod))
+    
+    res <- try(rma.mv(
+      yi = meta_es[[yi_col]],
+      V  = meta_es[[V_col]],
+      W  = meta_es[[W_col]],
+      mods = form_no_intercept, 
+      random = ~ 1 | Study_ID / Location_ID,
+      data = meta_es
+    ), silent = TRUE)
+    
+    if (!inherits(res, "try-error")) {
+      model_list[[out]][[mod]] <- res
+    }
+  }
+}
+
+
+# --- SECTION B: Extract Data from Models for Plotting ---
+
+# Function to safely extract subgroup means and CIs (for models WITHOUT intercept)
+extract_subgroup_data_with_n <- function(model, moderator_name, outcome_name) {
+  if (inherits(model, "try-error") || is.null(model)) return(NULL)
+  
+  coef_names <- names(coef(model))
+  subgroups <- gsub(moderator_name, "", coef_names, fixed = TRUE) %>% trimws()
+  
+  # Calculate N (observations) for each subgroup from the raw data
+  # We filter the raw data for each level to count rows
+  counts <- map_dbl(subgroups, function(lvl) {
+    sum(meta_es[[moderator_name]] == lvl, na.rm = TRUE)
+  })
+  
+  # Predict means and CIs
+  new_data <- diag(length(coef_names))
+  colnames(new_data) <- coef_names
+  preds <- predict(model, newmods = new_data)
+  
+  # --- CONVERT TO PERCENTAGE ---
+  # Formula: % Change = (exp(LnR) - 1) * 100
+  est_percent <- (exp(as.numeric(preds$pred)) - 1) * 100
+  lo_percent  <- (exp(as.numeric(preds$ci.lb)) - 1) * 100
+  hi_percent  <- (exp(as.numeric(preds$ci.ub)) - 1) * 100
+  
+  data.frame(
+    Outcome = outcome_name,
+    Moderator = moderator_name,
+    Subgroup = subgroups,
+    Estimate = est_percent,
+    CI_Lower = lo_percent,
+    CI_Upper = hi_percent,
+    N_Obs = counts,
+    Label = paste0(subgroups, " (n=", counts, ")") 
+  )
+}
+
+all_subgroup_data <- map_dfr(names(model_list), function(out_name) {
+  map_dfr(names(model_list[[out_name]]), function(mod_name) {
+    extract_subgroup_data_with_n(model_list[[out_name]][[mod_name]], mod_name, out_name)
+  })
+})
+
+############################### FOR ONLY IRRIGATION RELATED PLOT ##########################################
+# Filter for the 4 specific moderators to block together
+target_mods <- c("Irrigation_method", "Irri_amt", "Degree_of_irri_deficit_grp", "Irrigation_scheduling")
+plot_data <- all_subgroup_data %>% 
+  filter(Moderator %in% target_mods)
+
+# Adjust these based on your specific results to ensure all error bars are visible
+yield_lims <- c(-80, 80)
+cp_lims    <- c(-15, 15)
+iwue_lims  <- c(-150, 150)
+twp_lims   <- c(-150, 150)
+
+
+# Left side = Current name in data, Right side = New name for plot
+mod_names <- c(
+  "Irrigation_method"          = "Irrigation method",
+  "Irri_amt"                   = "Irrigation amount",
+  "Degree_of_irri_deficit_grp" = "Degree of deficit",
+  "Irrigation_scheduling"      = "Irrigation scheduling"
+)
+
+
+generate_stacked_plot <- function(df, outcome_name, x_label, x_lims) {
+  df_sub <- df %>% filter(Outcome == outcome_name)
+  
+  ggplot(df_sub, aes(y = Label, x = Estimate)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +
+    geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2, color = "black") +
+    geom_point(shape = 15, size = 3) +
+    # Added labeller here to rename the moderators
+    facet_grid(Moderator ~ ., 
+               scales = "free_y", 
+               space = "free_y", 
+               switch = "y",
+               labeller = as_labeller(mod_names)) + 
+    theme_bw() +
+    labs(x = x_label, y = "") +
+    xlim(x_lims) +
+    theme(
+      strip.text.y.left = element_text(angle = 0, face = "bold", size = 9),
+      strip.background = element_rect(fill = "gray95"),
+      strip.placement = "outside",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 8)
+    )
+}
+
+
+# Define the desired order for all subgroup levels (Bottom to Top)
+desired_order <- c(
+  # Degree_of_irri_deficit_grp
+  "Slight (>0.70)", "Moderate (0.35-0.70)", "Severe (<0.35)", 
+  
+  # MAT
+  ">10 °C", "≤10 °C", 
+  
+  # Irri_amt
+  "Over-irrigation", "Limited irrigation", "Zero-irrigation", 
+  
+  # Irrigation_method
+   "Surface irrigation", "Sprinkler irrigation", "Subsurface drip irrigation", 
+  
+  # Irrigation_scheduling
+  "Other", "Supplemental irrigation based", "Soil moisture based", "Evapotranspiration based"
+)
+
+
+# 2. Apply the order to the Subgroup and sync the Label
+plot_data <- plot_data %>%
+  # Force Subgroup to follow the manual list
+  mutate(Subgroup = fct_relevel(as.character(Subgroup), desired_order)) %>%
+  # Sort the dataframe by the new factor order
+  arrange(Subgroup) %>%
+  # Ensure the Label (which includes the 'n=') follows the Subgroup order
+  mutate(Label = fct_inorder(as.character(Label)))
+
+
+# Using the same generate_stacked_plot function as before
+p1 <- generate_stacked_plot(plot_data, "Yield", "Effect on forage yield (%)", yield_lims)
+p2 <- generate_stacked_plot(plot_data, "CP",    "Effect on crude protein (%)",    cp_lims)
+p3 <- generate_stacked_plot(plot_data, "IWUE",  "Effect on irrigation water use efficiency (%)",  iwue_lims)
+p4 <- generate_stacked_plot(plot_data, "TWP",   "Effect on total water productivity (%)",   twp_lims)
+
+# This makes the labels from panels (a) and (c) apply to the whole row
+p2_clean <- p2 + theme(
+  strip.background = element_blank(),
+  strip.text.y.left = element_blank()
+)
+
+p4_clean <- p4 + theme(
+  strip.background = element_blank(),
+  strip.text.y.left = element_blank()
+)
+
+# Panel (a) and (b) in row 1, Panel (c) and (d) in row 2
+irrigation_grid <- (p1 | p2_clean) / (p3 | p4_clean) + 
+  plot_annotation(
+    tag_levels = 'a', 
+    tag_suffix = ')'
+  )
+print(irrigation_grid)
+ggsave("Irrigation_Grid.png", irrigation_grid, width = 12, height = 8, dpi = 300)
+
+
+
+################ FOR ONLY CLIMATE< SOIL AND WINTERHARDINESS RELATED PLOT #################################
+
+
+
+# --- 1. Filter specifically for the Environmental/Soil moderators ---
+# We use a unique name 'plot_data_weather' to avoid overwriting issues
+target_mods <- c("MAP_mm_grp", "MAT_degreeC_grp", "Texture", "Soil_BD_grp",
+                  "Soil_pH_grp", "Soil_OM_grp", 
+                  "Winterhardiness_grp", "Latitude_grp", "Longitude_grp")
+plot_data <- all_subgroup_data %>% 
+  filter(Moderator %in% target_mods)
+
+# Define the limits for each outcome (adjust as needed to fix "Removed 1 row" warnings)
+yield_lims <- c(-100, 50)
+cp_lims    <- c(-20, 20)
+iwue_lims  <- c(-100, 250)
+twp_lims   <- c(-100, 250)
+
+# Create a "translation" vector for your moderator names
+mod_names <- c(
+  "MAP_mm_grp"          = "Mean annual\nprecipitation",
+  "MAT_degreeC_grp"     = "Mean annual\ntemperature",
+  "Texture"             = "Soil texture",
+  "Soil_BD_grp"         = "Soil bulk density",
+  "Soil_pH_grp"         = "Soil pH",
+  "Soil_OM_grp"         = "Soil\norganic matter",
+  "Winterhardiness_grp" = "Winterhardiness",
+  "Latitude_grp" = "Latitude",
+  "Longitude_grp" = "Longitude"
+)
+
+# 2. Updated function with the labeller
+generate_stacked_plot <- function(df, outcome_name, x_label, x_lims) {
+  df_sub <- df %>% filter(Outcome == outcome_name)
+  
+  ggplot(df_sub, aes(y = Label, x = Estimate)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +
+    geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2, color = "black") +
+    geom_point(shape = 15, size = 3) +
+    # Added labeller here to rename the moderators
+    facet_grid(Moderator ~ ., 
+               scales = "free_y", 
+               space = "free_y", 
+               switch = "y",
+               labeller = as_labeller(mod_names)) + 
+    theme_bw() +
+    labs(x = x_label, y = "") +
+    xlim(x_lims) +
+    theme(
+      strip.text.y.left = element_text(angle = 0, face = "bold", size = 9),
+      strip.background = element_rect(fill = "gray95"),
+      strip.placement = "outside",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 8)
+    )
+}
+
+# Define the desired order for all subgroup levels (Bottom to Top)
+desired_order <- c(
+  #Latitude
+  "Southern region", "Mid region", "Northern region",
+  
+  #Longitude
+  "Arid west", "Humid east",
+
+  # MAP
+  ">500 mm", "250–500 mm",  "<250 mm", 
+  
+  # MAT
+  ">10 °C", "≤10 °C", 
+  
+  # Soil Bulk Density
+  ">1.5 g cm^-3", "1.4–1.5 g cm^-3",  "<1.4 g cm^-3", 
+  
+  # Soil Organic Matter
+  ">1 %", "≤1 %", 
+  
+  # Soil pH 
+  ">7", "≤7", 
+  
+  # Soil Texture
+  "Coarse", "Medium", "Fine", 
+  
+  # Winterhardiness
+  "8a–9b","5a–7b",  "4a–4b"
+) 
+
+
+
+meta_es <- meta_es %>%
+  mutate(
+    Latitude_grp = case_when(
+      Latitude < 35 ~ "Southern region",
+      Latitude >= 35 & Latitude <= 45 ~ "Mid region",
+      Latitude > 45 ~ "Northern region",
+      TRUE ~ NA_character_
+    ),
+    # Create Longitude groups
+    Longitude_grp = case_when(
+      Longitude > -100 ~ "Humid east",
+      Longitude < -100 ~ "Arid west",
+      TRUE ~ NA_character_
+    )
+  )
+
+# 2. Apply the order to the Subgroup and sync the Label
+plot_data <- plot_data %>%
+  # Force Subgroup to follow the manual list
+  mutate(Subgroup = fct_relevel(as.character(Subgroup), desired_order)) %>%
+  # Sort the dataframe by the new factor order
+  arrange(Subgroup) %>%
+  # Ensure the Label (which includes the 'n=') follows the Subgroup order
+  mutate(Label = fct_inorder(as.character(Label)))
+
+
+
+# Using the same generate_stacked_plot function as before
+p1 <- generate_stacked_plot(plot_data, "Yield", "Effect on forage yield (%)", yield_lims)
+p2 <- generate_stacked_plot(plot_data, "CP",    "Effect on crude protein (%)",    cp_lims)
+p3 <- generate_stacked_plot(plot_data, "IWUE",  "Effect on irrigation water use efficiency (%)",  iwue_lims)
+p4 <- generate_stacked_plot(plot_data, "TWP",   "Effect on total water productivity (%)",   twp_lims)
+
+# --- 2. Remove moderator labels from the right-hand panels (b and d) ---
+# This makes the labels from panels (a) and (c) apply to the whole row
+p2_clean <- p2 + theme(
+  strip.background = element_blank(),
+  strip.text.y.left = element_blank()
+)
+
+p4_clean <- p4 + theme(
+  strip.background = element_blank(),
+  strip.text.y.left = element_blank()
+)
+
+# Panel (a) and (b) in row 1, Panel (c) and (d) in row 2
+weather_grid <- (p1 | p2_clean) / (p3 | p4_clean) + 
+  plot_annotation(
+    tag_levels = 'a', 
+    tag_suffix = ')'
+  )
+print(weather_grid)
+
+ggsave("Weather_Soil_Grid.png", weather_grid, width = 12, height = 10, dpi = 300)
+
+###################################################################################################################
+
+# --- Function to extract SE in percentage scale ---
+extract_se_percentage <- function(model_list, outcomes, target_mods) {
+  se_summary <- data.frame()
+  
+  for (out in outcomes) {
+    for (mod in target_mods) {
+      m <- model_list[[out]][[mod]]
+      
+      if (!is.null(m) && !inherits(m, "try-error")) {
+        # 1. Get coefficients and log-scale SE
+        coef_names <- names(coef(m))
+        subgroups  <- gsub(mod, "", coef_names, fixed = TRUE)
+        log_se     <- m$se  # Standard errors from the model
+        log_beta   <- as.numeric(m$beta)
+        
+        # 2. Convert to Percentage Scale SE (Delta Method)
+        # Formula: SE_percent = exp(beta) * SE_log * 100
+        se_percent <- exp(log_beta) * log_se * 100
+        
+        temp <- data.frame(
+          Outcome = out,
+          Moderator = mod,
+          Subgroup = subgroups,
+          Estimate_Pct = round((exp(log_beta) - 1) * 100, 2),
+          SE_PlusMinus = round(se_percent, 2)
+        )
+        se_summary <- rbind(se_summary, temp)
+      }
+    }
+  }
+  return(se_summary)
+}
+
+# --- Execute and Print ---
+# target_mods <- c("Irrigation_method", "Irri_amt", "Degree_of_irri_deficit_grp", "Irrigation_scheduling")
+target_mods <- c("MAP_mm_grp", "MAT_degreeC_grp", "Texture", "Soil_BD_grp",
+                 "Soil_pH_grp", "Soil_OM_grp",
+                 "Winterhardiness_grp", "Latitude_grp", "Longitude_grp")
+se_results <- extract_se_percentage(model_list, outcomes, target_mods)
+
+# This prints a table you can use to fill in your "±" values
+print(se_results)
+
+
+####################### Building Regression models #################################################################
+
+# --- 1. Filter for Irrigated Data (No NAs, No Zeroes) ---
+meta_es_irrigated <- meta_es %>% 
+  filter(!is.na(Irri_amt_mm_trt) & Irri_amt_mm_trt > 0)
+
+responses <- c("Yield_LnR", "CP_LnR")
+moderators <- c("Irrigation_method", "Irri_amt", "Degree_of_irri_deficit", 
+                "Irrigation_scheduling", "MAP_mm", "MAT_degreeC", 
+                "Texture", "Soil_BD_g.cm.3", "Soil_pH", "Soil_OM_.", 
+                "Winterhardiness", "Latitude", "Longitude")
+
+individual_results <- list()
+
+# --- 2. Run Stepwise Models ---
+for (resp in responses) {
+  temp_data <- meta_es_irrigated[, c(resp, moderators)]
+  data_clean <- na.omit(temp_data)
+  
+  # Check for moderators with more than one level
+  valid_mods <- moderators[sapply(data_clean[moderators], function(x) length(unique(x)) > 1)]
+  
+  if (length(valid_mods) > 0) {
+    f_full <- as.formula(paste(resp, "~", paste(valid_mods, collapse = " + ")))
+    f_null <- as.formula(paste(resp, "~ 1"))
+    
+    m_full <- lm(f_full, data = data_clean)
+    m_null <- lm(f_null, data = data_clean)
+    
+    individual_results[[paste0(resp, "_back")]] <- step(m_full, direction = "backward", trace = 0)
+    individual_results[[paste0(resp, "_fwd")]]  <- step(m_null, 
+                                                        scope = list(lower = f_null, upper = f_full), 
+                                                        direction = "forward", trace = 0)
+    message("Successfully modeled irrigated: ", resp)
+  }
+}
+
+# --- 3. Extract Summaries into Table ---
+ind_summary_list <- list() # Initialize the missing list
+
+for (model_name in names(individual_results)) {
+  current_model <- individual_results[[model_name]]
+  selected_vars <- labels(terms(current_model))
+  if(length(selected_vars) == 0) selected_vars <- "None (Intercept only)"
+  
+  ind_summary_list[[model_name]] <- data.frame(
+    Model_Name = model_name,
+    Moderators_Selected = paste(selected_vars, collapse = ", "),
+    Adj_R2 = round(summary(current_model)$adj.r.squared, 3),
+    AIC = round(AIC(current_model), 2),
+    BIC = round(BIC(current_model), 2),
+    R2 = round(summary(current_model)$r.squared, 3),
+    n = length(residuals(current_model))
+  )
+}
+
+# --- 4. Combine and Display ---
+summary_table_final <- do.call(rbind, ind_summary_list)
+rownames(summary_table_final) <- NULL
+print(summary_table_final)
+
+# Extract the coefficients from your forward model
+yield_coef <- coef(individual_results$Yield_LnR_fwd)
+CP_coef <- coef(individual_results$CP_LnR_back)
+print(yield_coef)
+print(CP_coef)
+
+# For the individual coefficients (p-values for each category)
+summary(individual_results$Yield_LnR_fwd)
+summary(individual_results$CP_LnR_back)
+
+# For the overall model significance (The F-statistic p-value)
+summary(individual_results$Yield_LnR_fwd)$fstatistic
+
+###########################################################################################################################
+
+
+# --- STEP 1: Reshaping with Unique Row IDs for Total Water Analysis ---
+plot_data_total <- meta_es %>%
+  mutate(Row_ID = row_number()) %>% 
+  select(Row_ID, Study_ID, MAP_mm_grp, 
+         Irri_amt_mm_trt, Irri_amt_mm_Ctrl, 
+         Yield_kg_trt, Yield_kg_ctrl, 
+         CP_trt, CP_ctrl, 
+         IWUE_kg.ha.mm_trt, IWUE_kg.ha.mm_ctrl) %>%
+  
+  pivot_longer(cols = c(Irri_amt_mm_trt, Irri_amt_mm_Ctrl),
+               names_to = "Type_X", values_to = "Total_Water") %>%
+  pivot_longer(cols = c(Yield_kg_trt, Yield_kg_ctrl),
+               names_to = "Type_Y1", values_to = "Yield_Value") %>%
+  pivot_longer(cols = c(CP_trt, CP_ctrl),
+               names_to = "Type_Y2", values_to = "CP_Value") %>%
+  pivot_longer(cols = c(IWUE_kg.ha.mm_trt, IWUE_kg.ha.mm_ctrl),
+               names_to = "Type_Y3", values_to = "IWUE_Value") %>%
+  
+  filter(
+    gsub(".*_", "", tolower(Type_X)) == gsub(".*_", "", tolower(Type_Y1)),
+    gsub(".*_", "", tolower(Type_X)) == gsub(".*_", "", tolower(Type_Y2)),
+    gsub(".*_", "", tolower(Type_X)) == gsub(".*_", "", tolower(Type_Y3))
+  ) %>%
+  select(-Type_X, -Type_Y1, -Type_Y2, -Type_Y3)
+
+# --- STEP 2: Pre-compute N per facet (numeric, not label) ---
+n_counts_total <- plot_data_total %>%
+  group_by(MAP_mm_grp) %>%
+  summarise(n_val = sum(!is.na(Total_Water)), .groups = "drop")
+
+plot_data_total <- left_join(plot_data_total, n_counts_total, by = "MAP_mm_grp")
+
+# --- STEP 3: Fixed Function for Box-Based Alignment ---
+generate_total_water_reg_plot <- function(df, y_var, y_label, y_lims,
+                                          stats_y_pos = "top", # Use "top" or "bottom"
+                                          show_x_title = FALSE) {
+  
+  # Determine if we are bottom-aligning for the N label
+  is_bottom <- stats_y_pos == "bottom"
+  
+  ggplot(df, aes(x = Total_Water, y = .data[[y_var]])) +
+    geom_point(alpha = 0.4, size = 1.5, shape = 21, fill = "gray80") +
+    geom_smooth(method = "lm", formula = y ~ x + I(x^2), color = "black", size = 0.8) +
+    
+    # --- 1. Regression Equation (Anchored to BOX, not points) ---
+    stat_poly_eq(
+      formula = y ~ x + I(x^2),
+      aes(label = paste(after_stat(eq.label), after_stat(rr.label), 
+                        after_stat(p.value.label), sep = "*', '*")),
+      parse = TRUE,
+      label.x = "right",    # Keywords force it to the physical edge
+      label.y = stats_y_pos, # Use "bottom" for CP
+      size = 3,
+      hjust = 1.2          # Nudges it slightly left so it doesn't hit the border
+    ) +
+    
+    # --- 2. N Label (Stays in corner) ---
+    geom_text(
+      data = distinct(df, MAP_mm_grp, n_val),
+      aes(label = paste0("(n = ", n_val, ")")),
+      x = Inf, 
+      y = if(is_bottom) -Inf else Inf,
+      hjust = 1.1, 
+      vjust = if(is_bottom) -3.5 else 2.3, 
+      size = 3,
+      inherit.aes = FALSE
+    ) +
+    
+    coord_cartesian(xlim = c(0, 2000), ylim = y_lims, clip = "off") +
+    facet_wrap(~ MAP_mm_grp, scales = "free_y") +
+    theme_bw() +
+    labs(y = NULL, x = if (show_x_title) "Irrigation water (mm)" else NULL) +
+    theme(
+      panel.grid.major = element_blank(), # Removes major grid lines
+      panel.grid.minor = element_blank(), # Removes minor grid lines
+      strip.background = element_rect(fill = "gray95"),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+
+# --- STEP 4: Generate plots ---
+
+# 1. Yield – top (Using "top" keyword)
+p1_yield <- generate_total_water_reg_plot(
+  plot_data_total,
+  "Yield_Value",
+  "Yield (kg ha⁻¹)",
+  c(0, 30000),
+  stats_y_pos = "top"  
+)
+
+# 2. CP – middle (Using "bottom" keyword)
+p2_cp <- generate_total_water_reg_plot(
+  plot_data_total,
+  "CP_Value",
+  "Crude Protein (%)",
+  c(0, 30),
+  stats_y_pos = "bottom" 
+) +
+  theme(strip.text = element_blank(),
+        strip.background = element_blank())
+
+# 3. TWP – bottom (Using "top" keyword)
+p3_twp <- generate_total_water_reg_plot(
+  plot_data_total,
+  "IWUE_Value",
+  "IWUE (kg ha⁻¹ mm⁻¹)",
+  c(0, 180),
+  stats_y_pos = "top", 
+  show_x_title = TRUE
+) +
+  theme(strip.text = element_blank(),
+        strip.background = element_blank())
+
+
+# --- STEP 5: Combine ---
+final_grid <- (p1_yield / p2_cp / p3_twp) +
+  plot_annotation(tag_levels = "a", tag_suffix = ")") &
+  theme(
+    plot.tag = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold", size = 10),
+    # Bold the common X-axis label here
+    axis.title.x = element_text(face = "bold", size = 11), 
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 25) # Increased left margin for safety
+  )
+
+# Explicitly re-apply labels to ensure they stick
+final_grid[[1]] <- final_grid[[1]] + 
+  ylab("Yield (kg ha⁻¹)") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+final_grid[[2]] <- final_grid[[2]] + 
+  ylab("Crude Protein (%)") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+final_grid[[3]] <- final_grid[[3]] + 
+  ylab("Irrigation water use efficiency (kg ha⁻¹ mm⁻¹)")
+
+print(final_grid)
+
+
+ggsave("Regression_IWUE.png", final_grid, width = 15, height = 10, dpi = 300)
+
+################################################################################
+
+# Calculate average baseline values for Full Irrigation (Control)
+baseline_stats <- meta_es %>%
+  group_by(MAP_mm_grp) %>%
+  summarize(
+    avg_yield_ctrl  = mean(Yield_kg_ctrl, na.rm = TRUE),
+    avg_water_ctrl  = mean(Irri_amt_mm_Ctrl, na.rm = TRUE),
+    avg_iwue_ctrl    = mean(IWUE_kg.ha.mm_ctrl, na.rm = TRUE),
+    avg_cp_ctrl     = mean(CP_ctrl, na.rm = TRUE),
+    n_studies       = n_distinct(Study_ID),
+    n_observations  = n()
+  ) %>%
+  arrange(MAP_mm_grp)
+
+# View the results
+print(baseline_stats)
+
+
+##########################################################################################################################
+
+# --- Sensitivity analysis Setup ---
+outcomes <- c("Yield", "CP", "IWUE", "TWP") 
+model_list_overall <- list()
+for (out in outcomes) {
+  model_list_overall[[out]] <- rma.mv(
+    yi = meta_es[[paste0(out, "_LnR")]],
+    V = meta_es[[paste0(out, "_Variance")]],
+    random = ~ 1 | Study_ID / Location_ID,
+    data = meta_es
+  )
+}
+
+
+# Study-Level Jackknife Function (MODIFIED for Percentage Change)
+run_jackknife_study_percent <- function(model, outcome_name, data_full) {
+  unique_study_ids <- unique(model$mf.r[]) %>% unlist() %>% as.character()
+  num_studies <- length(unique_study_ids)
+  
+  # Initialize variables in LnR format first
+  estimates_lnr <- rep(NA, num_studies)
+  ci_lower_lnr  <- rep(NA, num_studies)
+  ci_upper_lnr  <- rep(NA, num_studies)
+  
+  for (i in 1:num_studies) {
+    current_id_to_remove <- unique_study_ids[i]
+    
+    subset_data <- data_full[data_full$Study_ID != current_id_to_remove, ]
+    
+    # Run the model from scratch on the new subset_data 
+    res.loo <- rma.mv(
+      yi = subset_data[[paste0(outcome_name, "_LnR")]],
+      V = subset_data[[paste0(outcome_name, "_Variance")]],
+      random = ~ 1 | Location_ID, 
+      data = subset_data
+    )
+    
+    estimates_lnr[i] <- coef(res.loo)
+    ci_lower_lnr[i]  <- res.loo$ci.lb
+    ci_upper_lnr[i]  <- res.loo$ci.ub
+  }
+  
+  # --- Conversion to Percentage Change ---
+  # Apply the formula: (exp(LnR) - 1) * 100
+  estimates_percent <- (exp(estimates_lnr) - 1) * 100
+  ci_lower_percent  <- (exp(ci_lower_lnr) - 1) * 100
+  ci_upper_percent  <- (exp(ci_upper_lnr) - 1) * 100
+  
+  data.frame(
+    Outcome = outcome_name,
+    Study_Removed = unique_study_ids,
+    Estimate_Adj  = estimates_percent, # Renaming back to Estimate_Adj for plot function compatibility
+    CI_Lower_Adj  = ci_lower_percent,
+    CI_Upper_Adj  = ci_upper_percent
+  )
+}
+
+
+# Run the study-level jackknife for all specified outcomes and combine (using the new function)
+all_jackknife_results_study <- map_dfr(outcomes, ~run_jackknife_study_percent(model_list_overall[[.x]], .x, meta_es))
+
+
+# Jackknife Plotting Function
+plot_jackknife_results_grid <- function(df, outcome_name, x_label) {
+  df_sub <- df %>% filter(Outcome == outcome_name)
+  
+  # Calculate original overall mean and 95% CIs (from your existing list)
+  original_mean_lnr <- coef(model_list_overall[[outcome_name]]) 
+  original_mean <- (exp(original_mean_lnr) - 1) * 100
+  original_ci_lb <- (exp(model_list_overall[[outcome_name]]$ci.lb) - 1) * 100
+  original_ci_ub <- (exp(model_list_overall[[outcome_name]]$ci.ub) - 1) * 100
+  
+  ggplot(df_sub, aes(y = reorder(Study_Removed, Estimate_Adj), x = Estimate_Adj)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 0.5) + 
+    # Overall mean reference lines
+    geom_vline(xintercept = original_mean, linetype = "solid", color = "red", alpha = 0.6) + 
+    geom_vline(xintercept = c(original_ci_lb, original_ci_ub), linetype = "dashed", color = "red", alpha = 0.5) +
+    # Jackknife points
+    geom_errorbarh(aes(xmin = CI_Lower_Adj, xmax = CI_Upper_Adj), height = 0, color = "gray30") + 
+    geom_point(size = 1.2) +
+    theme_bw() +
+    labs(y = "", x = x_label) + 
+    xlim(-40, 60) + 
+    theme(
+      panel.grid.major = element_blank(), # Removes major grid lines
+      panel.grid.minor = element_blank(), # Removes minor grid lines
+      axis.text.y = element_text(size = 6),
+      panel.grid.major.y = element_blank(),
+      axis.title.x = element_text(size = 9, face = "bold")
+    )
+}
+
+
+# Generate individual panels
+pj1 <- plot_jackknife_results_grid(all_jackknife_results_study, "Yield", "Percentage change of yield")
+pj2 <- plot_jackknife_results_grid(all_jackknife_results_study, "CP",    "Percentage change of crude protein")
+pj3 <- plot_jackknife_results_grid(all_jackknife_results_study, "IWUE",  "Percentage change of irrigation water use efficiency")
+pj4 <- plot_jackknife_results_grid(all_jackknife_results_study, "TWP",   "Percentage change of total water productivity")
+
+# --- 2. Create the 2x2 Layout ---
+# We use the original pj1, pj2, pj3, pj4 (none are "cleaned")
+jackknife_grid <- (pj1 | pj2) / (pj3 | pj4) + 
+  plot_annotation(
+    tag_levels = 'a',
+    tag_suffix = ')'
+  ) +
+  # widths = c(1, 1) ensures equal spacing for the Y-axis labels in both columns
+  plot_layout(guides = 'collect', widths = c(1, 1)) &
+  theme(
+    plot.tag.position = c(0.03, 1.02),
+    plot.tag = element_text(size = 11, face = "bold"),
+    # Ensure Y axis text is visible for all
+    axis.text.y = element_text(size = 6) 
+  )
+
+# --- 3. Add common Y-axis label using cowplot ---
+final_sensitivity_plot <- cowplot::ggdraw(jackknife_grid) +
+  cowplot::draw_label("Study ID removed", x = 0.005, y = 0.5, angle = 90, 
+                      vjust = 0.5, size = 11, fontface = "bold")
+
+print(final_sensitivity_plot)
+
+ggsave("Sensitivity_Grid.png", final_sensitivity_plot, width = 12, height = 8, dpi = 300)
+
+############################################################################################
+
+# Checking that if the imputed data modified the results using Leave one out analysis
+
+meta_modi <- meta %>%
+  dplyr::mutate(
+    #Log-response and variance for Yield
+    Yield_LnR = log(Yield_kg_trt / Yield_kg_ctrl),
+    
+    Yield_Variance = (Yield_kg_SD_ctrl^2 / (Rep_ctrl * Yield_kg_ctrl^2)) +
+      (Yield_kg_SD_trt^2  / (Rep_trt  * Yield_kg_trt^2)),
+    
+    #Log-response and variance for CP
+    CP_LnR = log(CP_trt / CP_ctrl),
+    
+    CP_Variance = (CP_SD_ctrl^2 / (Rep_ctrl * CP_ctrl^2)) +
+      (CP_SD_trt^2  / (Rep_trt  * CP_trt^2)),
+    
+    #Log-response and variance for IWUE
+    IWUE_LnR = log(IWUE_kg.ha.mm_trt / IWUE_kg.ha.mm_ctrl),
+    
+    IWUE_Variance = (IWUE_kg.ha.mm_SD_ctrl^2 / (Rep_ctrl * IWUE_kg.ha.mm_ctrl^2)) +
+      (IWUE_kg.ha.mm_SD_trt^2  / (Rep_trt  * IWUE_kg.ha.mm_trt^2)),
+    
+    #Log-response and variance for TWP
+    TWP_LnR = log(TWP_kg.ha.mm_trt / TWP_kg.ha.mm_ctrl),
+    
+    TWP_Variance = (TWP_kg.ha.mm_SD_ctrl^2 / (Rep_ctrl * TWP_kg.ha.mm_ctrl^2)) +
+      (TWP_kg.ha.mm_SD_trt^2  / (Rep_trt  * TWP_kg.ha.mm_trt^2)),
+    
+    #weights
+    Yield_weight = 1/Yield_Variance,
+    CP_weight = 1/CP_Variance,
+    IWUE_weight = 1/IWUE_Variance,
+    TWP_weight = 1/TWP_Variance
+  )
+
+# --- Sensitivity Analysis: Imputed vs. Observed SDs ---
+comparison_list <- list()
+outcomes <- c("Yield", "CP", "IWUE", "TWP")
+
+for (out in outcomes) {
+  # 1. Main Model (Imputed + Original - from meta_es)
+  # Filter to ensure rows have data for this specific outcome
+  data_full <- meta_es[!is.na(meta_es[[paste0(out, "_LnR")]]), ]
+  
+  mod_full <- rma.mv(
+    yi = data_full[[paste0(out, "_LnR")]],
+    V = data_full[[paste0(out, "_Variance")]],
+    random = ~ 1 | Study_ID / Location_ID,
+    data = data_full
+  )
+  
+  # 2. Observed Only Model (Original SDs only - from meta)
+  # Filter to ensure rows have data for this specific outcome in 'meta'
+  data_obs <- meta_modi[!is.na(meta_modi[[paste0(out, "_LnR")]]), ]
+  
+  mod_obs <- rma.mv(
+    yi = data_obs[[paste0(out, "_LnR")]],
+    V = data_obs[[paste0(out, "_Variance")]],
+    random = ~ 1 | Study_ID / Location_ID,
+    data = data_obs
+  )
+  
+  # Helper to format as Percentage Change: (exp(x)-1)*100
+  fmt_res <- function(m) {
+    est <- (exp(coef(m)) - 1) * 100
+    lo  <- (exp(m$ci.lb) - 1) * 100
+    hi  <- (exp(m$ci.ub) - 1) * 100
+    paste0(round(est, 2), "% (", round(lo, 2), ", ", round(hi, 2), ")")
+  }
+  
+  # Store results in a row
+  comparison_list[[out]] <- data.frame(
+    Outcome = out,
+    Full_k = mod_full$k,
+    Full_Estimate_Percent = fmt_res(mod_full),
+    Observed_k = mod_obs$k,
+    Observed_Estimate_Percent = fmt_res(mod_obs),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Final Table for Supplementary
+sensitivity_table <- do.call(rbind, comparison_list)
+print(sensitivity_table)
+##########################################################################################
+
+# Checking weights of observed and imputed data added in supplementary table2
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+outcomes <- c("Yield", "CP", "IWUE", "TWP")
+all_weight_data <- list()
+summary_list <- list()
+
+for (out in outcomes) {
+  # 1. Identify the SD column in original data
+  actual_col <- colnames(meta_modi)[grep(paste0(out, ".*SD"), colnames(meta_modi), ignore.case = TRUE)][1]
+  
+  if (!is.na(actual_col)) {
+    # 2. Flag imputed rows and filter for this specific outcome
+    # We assume meta_es and meta_modi are aligned by row
+    temp_es <- meta_es
+    temp_es$is_imputed <- is.na(meta_modi[[actual_col]])
+    
+    # Filter for rows that actually have an Effect Size for this outcome
+    dat_sub <- temp_es[!is.na(temp_es[[paste0(out, "_LnR")]]), ]
+    
+    # 3. Run the model to get weights
+    mod <- rma.mv(
+      yi = dat_sub[[paste0(out, "_LnR")]], 
+      V = dat_sub[[paste0(out, "_Variance")]],
+      random = ~ 1 | Study_ID / Location_ID, 
+      data = dat_sub
+    )
+    
+    # Extract weights
+    dat_sub$Weight_Pct <- weights(mod)
+    dat_sub$Outcome_Name <- out
+    
+    # Store for plotting
+    all_weight_data[[out]] <- dat_sub %>% select(Outcome_Name, is_imputed, Weight_Pct)
+    
+    # 4. Create Summary for this outcome
+    summary_list[[out]] <- dat_sub %>%
+      group_by(is_imputed) %>%
+      summarise(
+        Outcome = out,
+        N_Studies = n(),
+        Total_Weight = sum(Weight_Pct),
+        Avg_Weight = mean(Weight_Pct),
+        Max_Weight = max(Weight_Pct)
+      ) %>%
+      mutate(Source = if_else(is_imputed, "Imputed", "Observed"))
+  }
+}
+
+# --- Final Table ---
+final_summary_table <- bind_rows(summary_list) %>%
+  select(Outcome, Source, N_Studies, Total_Weight, Avg_Weight, Max_Weight) %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+print("Final Weight Distribution Summary:")
+print(final_summary_table)
+
+
+
+#############################################################################################
+
+# --- SECTION 1: Data Preparation and Bias Adjustment ---
+
+# Run the base meta-analysis model using the 'meta' package
+m.yield <- metagen(
+  TE = Yield_LnR,          # Treatment Effect (Log Response Ratio)
+  seTE = Yield_SE,         # Standard Error of the Treatment Effect
+  data = meta_es,
+  studlab = Study_ID / Location_ID,      # Study labels for identification
+  comb.random = TRUE       # Use a random-effects model
+)
+
+# Apply the trim-and-fill method to estimate and impute missing studies on the left side
+m.yield.tf <- trimfill(m.yield, side = "left")
+
+
+# --- SECTION 2: Compare Overall Pooled Effects (Sensitivity Analysis) ---
+# This is the key comparison for the main sensitivity analysis in your paper
+
+# Extract the overall pooled effect from the original data model
+original_pooled <- data.frame(
+  Dataset = "Original Data (Before Adjustment)",
+  Metric = "Yield_Overall_Effect",
+  P_value = summary(m.yield)$random$p,        # P-value for the overall random effects model
+  Estimate_LnR = summary(m.yield)$TE.random, # The average effect size (LnR)
+  stringsAsFactors = FALSE
+)
+
+# Extract the overall pooled effect from the bias-adjusted data model
+adjusted_pooled <- data.frame(
+  Dataset = "Bias Adjusted (Trim-Fill)",
+  Metric = "Yield_Overall_Effect",
+  P_value = summary(m.yield.tf)$random$p,
+  Estimate_LnR = summary(m.yield.tf)$TE.random,
+  stringsAsFactors = FALSE
+)
+
+# Combine results into a single, clean table for direct comparison
+final_comparison_table <- bind_rows(original_pooled, adjusted_pooled)
+
+# Print the comparison table
+print(final_comparison_table)
+
+
+##################################################### Making the MAP ########################################
+
+# --- 1. Get the US Map Data ---
+us_states <- map_data("state")
+
+# --- 2. Prepare Your Data (Piped Approach) ---
+
+# Select unique latitude and longitude pairs from your meta_es data frame
+# This handles multiple occurrences of the same location by keeping only one row per coordinate pair
+unique_locations <- meta_es %>%
+  select(Longitude, Latitude, Reference, Study_ID, Location_ID) %>% # Select necessary columns
+  distinct() %>%                         # Keep only unique rows
+  # Optional: Filter to ensure points are within typical US bounds if you have global data
+  filter(Longitude > -130 & Longitude < -65 & Latitude > 20 & Latitude < 50)
+
+
+# --- 3. Create the Map Visualization ---
+
+ggplot() +
+  # Layer 1: Plot the state boundaries (polygons)
+  geom_polygon(
+    data = us_states, 
+    aes(x = long, y = lat, group = group), 
+    fill = "grey90",         # Light grey fill
+    color = "black",         # Black state borders
+    size = 0.3
+  ) +
+  # Layer 2: Plot your unique data points
+  geom_point(
+    data = unique_locations, 
+    aes(x = Longitude, y = Latitude), # Color points by Study ID
+    size = 6,              
+    alpha = 0.5,
+    show.legend = FALSE # Hide the legend if you have too many studies
+  ) +
+  # Use the Albers projection for a nice US view and set limits
+  coord_map("albers", lat0 = 39, lat1 = 45) + 
+  theme_bw() +      # Use a clean black and white theme
+  labs(
+    title = "",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+# Use ggsave to save the map as an image file
+# ggsave("US_Locations_Map_Unique_Points.png", width = 10, height = 7, dpi = 300)
+
+
+##################################### FINAL MAP ######### WorldClim 1970-2000 baseline used here ##############################################
+
+study_points_sf <- st_as_sf(meta_es, 
+                            coords = c("Longitude", "Latitude"), 
+                            crs = 4326)
+
+# Geometry  
+sf::sf_use_s2(FALSE) 
+us_mask_sf <- st_as_sf(maps::map("state", plot = FALSE, fill = TRUE)) %>%
+  st_make_valid() %>% 
+  st_union()
+us_vect <- vect(us_mask_sf)
+
+# Process Growing Season Precip
+prec_global <- geodata::worldclim_global(var = "prec", res = 10, path = tempdir())
+gsp_raster <- sum(prec_global[[4:10]]) # April to October
+gsp_masked <- crop(gsp_raster, us_vect) %>% mask(us_vect)
+
+gsp_df <- as.data.frame(gsp_masked, xy = TRUE)
+colnames(gsp_df) <- c("long", "lat", "prec_sum")
+
+
+map <- ggplot() +
+  # Background Heatmap
+  geom_tile(data = gsp_df, aes(x = long, y = lat, fill = prec_sum)) +
+  
+  # Custom RGB Scale for Precipitation
+  scale_fill_gradientn(
+    colors = c("#e41a1c", "#4daf4a", "#377eb8"), 
+    name = "Mean annual\nprecipitation (mm)",
+    na.value = "transparent"
+  ) +
+  
+  # State Borders
+  geom_sf(data = st_as_sf(maps::map("state", plot = FALSE, fill = TRUE)), 
+          fill = NA, color = "black", size = 0.2) +
+  
+  geom_sf(data = study_points_sf, aes(shape = "Study sites"), 
+          size = 3, fill = "white", color = "black", alpha = 0.8) +
+  
+  # Define the manual scale for the points
+  scale_shape_manual(name = "", values = c("Study sites" = 21)) +
+  
+  # Scale bar
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  
+  # North arrow
+  annotation_north_arrow(location = "tl", which_north = "true", 
+                         pad_x = unit(0.2, "in"), pad_y = unit(0.2, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  
+  # Coordinates and Theme
+  coord_sf(crs = 4326, xlim = c(-125, -67), ylim = c(25, 50)) + 
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.box = "vertical",           # Stack legends vertically
+    legend.spacing.y = unit(0, "cm"),  # Move them closer together
+    axis.title = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 11),
+  ) +
+  labs(
+    title = "",
+    x = "Longitude",
+    y = "Latitude"  
+  )
+
+map
+
+ggsave("Map.png", map, width = 14, height = 8, dpi = 300)
