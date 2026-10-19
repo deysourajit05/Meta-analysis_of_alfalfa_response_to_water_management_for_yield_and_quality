@@ -1,4 +1,4 @@
-# Meta-analysis_of_alfalfa_response_to_water_management_for_yield_and_quality
+# Meta-analysis_of_irrigated_alfalfa_response_to_water_management_for_yield_and_crude_protein
 Code and data for a meta-analysis quantifying irrigation effects on alfalfa yield, forage quality, and water productivity across the United States.
 This repository contains the data and code used for a meta-analysis evaluating the effects of irrigation water management on alfalfa (Medicago sativa L.) yield,
 crude protein (CP), irrigation water productivity (WPI), and total water productivity (TWP) across the United States.
